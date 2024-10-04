@@ -1,0 +1,11 @@
+[package]
+name = "connect-rpc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+base64 = "0.22"
+form_urlencoded = "1.2.1"
+http = "1.1"
+percent-encoding = "2.3.1"
+thiserror = "1.0"
