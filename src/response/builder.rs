@@ -1,4 +1,4 @@
-use http::{header, HeaderMap, StatusCode};
+use http::{header, HeaderMap, HeaderName, StatusCode};
 
 use crate::{
     common::{is_valid_http_token, CONNECT_CONTENT_ENCODING, CONTENT_TYPE_PREFIX},
@@ -23,9 +23,24 @@ impl ResponseBuilder {
         self
     }
 
-    /// Gets a mutable reference to the response [`Metadata`].
-    pub fn metadata_mut(&mut self) -> &mut impl Metadata {
-        &mut self.metadata
+    /// Appends ASCII metadata to the response.
+    pub fn ascii_metadata(
+        mut self,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
+        val: impl Into<String>,
+    ) -> Result<Self, Error> {
+        self.metadata.append_ascii(key, val)?;
+        Ok(self)
+    }
+
+    /// Appends binary metadata to the response.
+    pub fn binary_metadata(
+        mut self,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
+        val: impl AsRef<[u8]>,
+    ) -> Result<Self, Error> {
+        self.metadata.append_binary(key, val)?;
+        Ok(self)
     }
 
     /// Sets the message codec for this response.

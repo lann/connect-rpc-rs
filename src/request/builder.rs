@@ -1,15 +1,15 @@
 use http::{
     header,
     uri::{Authority, Parts, PathAndQuery, Scheme},
-    HeaderMap, HeaderValue, Method, Request, Uri,
+    HeaderMap, HeaderName, HeaderValue, Method, Request, Uri,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE, Engine};
 
 use crate::{
     common::{
-        is_valid_http_token, CONNECT_ACCEPT_ENCODING, CONNECT_CONTENT_ENCODING, CONNECT_TIMEOUT_MS,
-        CONTENT_TYPE_PREFIX,
+        is_valid_http_token, CONNECT_ACCEPT_ENCODING, CONNECT_CONTENT_ENCODING,
+        CONNECT_PROTOCOL_VERSION, CONNECT_TIMEOUT_MS, CONTENT_TYPE_PREFIX, PROTOCOL_VERSION_1,
     },
     metadata::Metadata,
     Error,
@@ -120,9 +120,24 @@ impl RequestBuilder {
         Ok(self)
     }
 
-    /// Gets a mutable reference to the request [`Metadata`].
-    pub fn metadata_mut(&mut self) -> &mut impl Metadata {
-        &mut self.metadata
+    /// Appends ASCII metadata to the request.
+    pub fn ascii_metadata(
+        mut self,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
+        val: impl Into<String>,
+    ) -> Result<Self, Error> {
+        self.metadata.append_ascii(key, val)?;
+        Ok(self)
+    }
+
+    /// Appends binary metadata to the request.
+    pub fn binary_metadata(
+        mut self,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
+        val: impl AsRef<[u8]>,
+    ) -> Result<Self, Error> {
+        self.metadata.append_binary(key, val)?;
+        Ok(self)
     }
 
     /// Sets the message codec for this request.
@@ -186,6 +201,8 @@ impl RequestBuilder {
         let mut req = Request::new(body);
         *req.method_mut() = method;
         let mut headers: HeaderMap = std::mem::take(&mut self.metadata);
+        // Connect-Protocol-Version → "connect-protocol-version" "1"
+        headers.insert(CONNECT_PROTOCOL_VERSION, PROTOCOL_VERSION_1);
         // Timeout → "connect-timeout-ms" Timeout-Milliseconds
         if let Some(timeout) = self.timeout_ms.take() {
             headers.insert(CONNECT_TIMEOUT_MS, timeout);

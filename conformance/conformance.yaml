@@ -1,0 +1,16 @@
+features:
+  versions:
+    - HTTP_VERSION_1
+    - HTTP_VERSION_2
+  protocols:
+    - PROTOCOL_CONNECT
+  codecs:
+    - CODEC_PROTO
+    # TODO: CODEC_JSON
+  compressions:
+    - COMPRESSION_IDENTITY
+  stream_types:
+    - STREAM_TYPE_UNARY
+    # TODO: streaming types
+  supportsTls: false
+  supportsMessageReceiveLimit: false

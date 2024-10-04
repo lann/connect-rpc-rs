@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::HashMap, time::Duration};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE, Engine};
+use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use http::{
     header,
     uri::{Authority, Scheme},
@@ -10,7 +10,7 @@ use http::{
 use crate::{
     common::{
         streaming_message_codec, unary_message_codec, CONNECT_ACCEPT_ENCODING,
-        CONNECT_CONTENT_ENCODING, CONNECT_PROTOCOL_VERSION, CONNECT_TIMEOUT_MS,
+        CONNECT_CONTENT_ENCODING, CONNECT_PROTOCOL_VERSION, CONNECT_TIMEOUT_MS, PROTOCOL_VERSION_1,
         STREAMING_CONTENT_TYPE_PREFIX,
     },
     metadata::Metadata,
@@ -57,6 +57,9 @@ pub trait ConnectRequest {
 
     /// Returns the metadata.
     fn metadata(&self) -> &impl Metadata;
+
+    /// Validates the request.
+    fn validate(&self) -> Result<(), Error>;
 }
 
 /// Connect request types.
@@ -84,50 +87,74 @@ impl<T> ConnectRequestType<T> {
 
 /// A [`ConnectRequest`] backed by an [`http::Request`]
 trait HttpConnectRequest {
-    fn uri(&self) -> &Uri;
+    fn http_uri(&self) -> &Uri;
 
-    fn headers(&self) -> &HeaderMap;
+    fn http_headers(&self) -> &HeaderMap;
 
-    fn message_codec(&self) -> Result<&str, Error>;
+    fn http_message_codec(&self) -> Result<&str, Error>;
 
-    fn connect_protocol_version(&self) -> Option<&str> {
-        self.headers().get(CONNECT_PROTOCOL_VERSION)?.to_str().ok()
+    fn http_connect_protocol_version(&self) -> Option<&str> {
+        self.http_headers()
+            .get(CONNECT_PROTOCOL_VERSION)?
+            .to_str()
+            .ok()
     }
 
-    fn content_encoding(&self) -> Option<&str>;
+    fn http_content_encoding(&self) -> Option<&str>;
 
-    fn accept_encoding(&self) -> impl Iterator<Item = &str> {
-        self.headers()
+    fn http_accept_encoding(&self) -> impl Iterator<Item = &str> {
+        self.http_headers()
             .get_all(header::ACCEPT_ENCODING)
             .into_iter()
             .filter_map(|val| val.to_str().ok())
     }
+
+    fn http_validate(&self) -> Result<(), Error>
+    where
+        Self: Sized,
+    {
+        validate_request(self)
+    }
+}
+
+fn validate_request(req: &impl HttpConnectRequest) -> Result<(), Error> {
+    match req.http_connect_protocol_version() {
+        None => (),
+        Some(ver) if ver == PROTOCOL_VERSION_1 => (),
+        Some(ver) => {
+            return Err(Error::InvalidRequest(format!(
+                "unknown connect-protocol-version {ver:?}"
+            )));
+        }
+    }
+    let _ = req.http_message_codec()?;
+    Ok(())
 }
 
 impl<T: HttpConnectRequest> ConnectRequest for T {
     fn connect_protocol_version(&self) -> Option<&str> {
-        HttpConnectRequest::connect_protocol_version(self)
+        HttpConnectRequest::http_connect_protocol_version(self)
     }
 
     fn scheme(&self) -> Option<&Scheme> {
-        self.uri().scheme()
+        self.http_uri().scheme()
     }
 
     fn authority(&self) -> Option<&Authority> {
-        self.uri().authority()
+        self.http_uri().authority()
     }
 
     fn path(&self) -> &str {
-        self.uri().path()
+        self.http_uri().path()
     }
 
     fn message_codec(&self) -> Result<&str, Error> {
-        HttpConnectRequest::message_codec(self)
+        self.http_message_codec()
     }
 
     fn timeout(&self) -> Option<Duration> {
         let timeout_ms: u64 = self
-            .headers()
+            .http_headers()
             .get(CONNECT_TIMEOUT_MS)?
             .to_str()
             .ok()?
@@ -137,15 +164,19 @@ impl<T: HttpConnectRequest> ConnectRequest for T {
     }
 
     fn content_encoding(&self) -> Option<&str> {
-        HttpConnectRequest::content_encoding(self)
+        self.http_content_encoding()
     }
 
     fn accept_encoding(&self) -> impl Iterator<Item = &str> {
-        HttpConnectRequest::accept_encoding(self)
+        self.http_accept_encoding()
     }
 
     fn metadata(&self) -> &impl Metadata {
-        self.headers()
+        self.http_headers()
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        self.http_validate()
     }
 }
 
@@ -153,20 +184,23 @@ impl<T: HttpConnectRequest> ConnectRequest for T {
 pub struct UnaryRequest<T>(http::Request<T>);
 
 impl<T> HttpConnectRequest for UnaryRequest<T> {
-    fn uri(&self) -> &Uri {
+    fn http_uri(&self) -> &Uri {
         self.0.uri()
     }
 
-    fn headers(&self) -> &HeaderMap {
+    fn http_headers(&self) -> &HeaderMap {
         self.0.headers()
     }
 
-    fn message_codec(&self) -> Result<&str, Error> {
-        unary_message_codec(self.headers())
+    fn http_message_codec(&self) -> Result<&str, Error> {
+        unary_message_codec(self.http_headers())
     }
 
-    fn content_encoding(&self) -> Option<&str> {
-        self.headers().get(header::CONTENT_ENCODING)?.to_str().ok()
+    fn http_content_encoding(&self) -> Option<&str> {
+        self.http_headers()
+            .get(header::CONTENT_ENCODING)?
+            .to_str()
+            .ok()
     }
 }
 
@@ -186,24 +220,27 @@ impl<T> From<UnaryRequest<T>> for http::Request<T> {
 pub struct StreamingRequest<T>(http::Request<T>);
 
 impl<T> HttpConnectRequest for StreamingRequest<T> {
-    fn uri(&self) -> &Uri {
+    fn http_uri(&self) -> &Uri {
         self.0.uri()
     }
 
-    fn headers(&self) -> &HeaderMap {
+    fn http_headers(&self) -> &HeaderMap {
         self.0.headers()
     }
 
-    fn message_codec(&self) -> Result<&str, Error> {
-        streaming_message_codec(self.headers())
+    fn http_message_codec(&self) -> Result<&str, Error> {
+        streaming_message_codec(self.http_headers())
     }
 
-    fn content_encoding(&self) -> Option<&str> {
-        self.headers().get(CONNECT_CONTENT_ENCODING)?.to_str().ok()
+    fn http_content_encoding(&self) -> Option<&str> {
+        self.http_headers()
+            .get(CONNECT_CONTENT_ENCODING)?
+            .to_str()
+            .ok()
     }
 
-    fn accept_encoding(&self) -> impl Iterator<Item = &str> {
-        self.headers()
+    fn http_accept_encoding(&self) -> impl Iterator<Item = &str> {
+        self.http_headers()
             .get_all(CONNECT_ACCEPT_ENCODING)
             .into_iter()
             .filter_map(|val| val.to_str().ok())
@@ -236,7 +273,7 @@ impl UnaryGetRequest {
             .ok_or(Error::invalid_request("missing message"))?;
         let is_b64 = self.query.get("base64").map(|s| s.as_str()) == Some("1");
         if is_b64 {
-            Ok(BASE64_URL_SAFE.decode(message)?.into())
+            Ok(BASE64_URL_SAFE_NO_PAD.decode(message)?.into())
         } else {
             Ok(
                 match percent_encoding::percent_decode_str(message)
@@ -252,27 +289,38 @@ impl UnaryGetRequest {
 }
 
 impl HttpConnectRequest for UnaryGetRequest {
-    fn uri(&self) -> &Uri {
+    fn http_uri(&self) -> &Uri {
         self.inner.uri()
     }
 
-    fn headers(&self) -> &HeaderMap {
+    fn http_headers(&self) -> &HeaderMap {
         self.inner.headers()
     }
 
-    fn message_codec(&self) -> Result<&str, Error> {
+    fn http_message_codec(&self) -> Result<&str, Error> {
         self.query
             .get("encoding")
             .map(|s| s.as_str())
-            .ok_or(Error::invalid_request("missing 'message' param"))
+            .ok_or(Error::invalid_request("missing 'encoding' param"))
     }
 
-    fn connect_protocol_version(&self) -> Option<&str> {
+    fn http_connect_protocol_version(&self) -> Option<&str> {
         self.query.get("connect")?.strip_prefix("v")
     }
 
-    fn content_encoding(&self) -> Option<&str> {
+    fn http_content_encoding(&self) -> Option<&str> {
         self.query.get("encoding").map(|s| s.as_str())
+    }
+
+    fn http_validate(&self) -> Result<(), Error>
+    where
+        Self: Sized,
+    {
+        validate_request(self)?;
+        if !self.query.contains_key("message") {
+            return Err(Error::invalid_request("missing 'message' param"));
+        }
+        Ok(())
     }
 }
 
@@ -283,5 +331,11 @@ impl From<http::Request<()>> for UnaryGetRequest {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
         Self { inner: req, query }
+    }
+}
+
+impl From<UnaryGetRequest> for http::Request<()> {
+    fn from(req: UnaryGetRequest) -> Self {
+        req.inner
     }
 }

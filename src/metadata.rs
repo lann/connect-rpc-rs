@@ -1,12 +1,12 @@
-use base64::{engine::general_purpose::STANDARD_NO_PAD as BASE64, Engine};
-use http::{
-    header::{AsHeaderName, IntoHeaderName},
-    HeaderMap, HeaderValue,
+use http::{header::AsHeaderName, HeaderMap, HeaderName, HeaderValue};
+
+use crate::{
+    common::{base64_decode, base64_encode},
+    Error,
 };
 
-use crate::Error;
-
-const BIN: &str = "-bin";
+const BIN_SUFFIX: &str = "-bin";
+const TRAILER_PREFIX: &str = "trailer-";
 
 pub trait Metadata {
     fn get_ascii(&self, key: impl AsHeaderName + AsRef<str>) -> Option<&str>;
@@ -20,109 +20,152 @@ pub trait Metadata {
         key: impl AsHeaderName + AsRef<str>,
     ) -> impl Iterator<Item = Vec<u8>> + '_;
 
+    fn iter_ascii(&self) -> impl Iterator<Item = (&str, &str)>;
+
+    fn iter_binary(&self) -> impl Iterator<Item = (&str, Vec<u8>)>;
+
     fn insert_ascii(
         &mut self,
-        key: impl IntoHeaderName + AsRef<str>,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
         val: impl Into<String>,
     ) -> Result<(), Error>;
 
     fn insert_binary(
         &mut self,
-        key: impl IntoHeaderName + AsRef<str>,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
         val: impl AsRef<[u8]>,
     ) -> Result<(), Error>;
 
     fn append_ascii(
         &mut self,
-        key: impl IntoHeaderName + AsRef<str>,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
         val: impl Into<String>,
     ) -> Result<(), Error>;
 
     fn append_binary(
         &mut self,
-        key: impl IntoHeaderName + AsRef<str>,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
         val: impl AsRef<[u8]>,
     ) -> Result<(), Error>;
 }
 
 impl Metadata for HeaderMap {
     fn get_ascii(&self, key: impl AsHeaderName + AsRef<str>) -> Option<&str> {
-        if key.as_ref().ends_with(BIN) {
+        if key.as_ref().ends_with(BIN_SUFFIX) {
             return None;
         }
-        self.get(key)?.to_str().ok()
+        get_maybe_trailer(self, key)?.to_str().ok()
     }
 
     fn get_binary(&self, key: impl AsHeaderName + AsRef<str>) -> Option<Vec<u8>> {
-        if !key.as_ref().ends_with(BIN) {
+        if !key.as_ref().ends_with(BIN_SUFFIX) {
             return None;
         }
-        let b64 = self.get(key)?;
-        BASE64.decode(b64.as_bytes()).ok()
+        let b64 = get_maybe_trailer(self, key)?;
+        base64_decode(b64).ok()
     }
 
     fn get_all_ascii(&self, key: impl AsHeaderName + AsRef<str>) -> impl Iterator<Item = &str> {
-        if key.as_ref().ends_with(BIN) {
-            self.get_all("")
-        } else {
-            self.get_all(key)
-        }
-        .into_iter()
-        .filter_map(|val| val.to_str().ok())
+        let override_empty = key.as_ref().ends_with(BIN_SUFFIX);
+        get_all_maybe_trailer(self, key, override_empty).filter_map(|val| val.to_str().ok())
     }
 
     fn get_all_binary(
         &self,
         key: impl AsHeaderName + AsRef<str>,
     ) -> impl Iterator<Item = Vec<u8>> + '_ {
-        if !key.as_ref().ends_with(BIN) {
-            self.get_all("")
-        } else {
-            self.get_all(key)
-        }
-        .into_iter()
-        .filter_map(|val| BASE64.decode(val).ok())
+        let override_empty = !key.as_ref().ends_with(BIN_SUFFIX);
+        get_all_maybe_trailer(self, key, override_empty).filter_map(|val| base64_decode(val).ok())
+    }
+
+    fn iter_ascii(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.iter().filter_map(|(key, val)| {
+            let key = key.as_str();
+            if key.ends_with(BIN_SUFFIX) {
+                return None;
+            }
+            let key = key.strip_prefix(TRAILER_PREFIX).unwrap_or(key);
+            Some((key, val.to_str().ok()?))
+        })
+    }
+
+    fn iter_binary(&self) -> impl Iterator<Item = (&str, Vec<u8>)> {
+        self.iter().filter_map(|(key, val)| {
+            let key = key.as_str();
+            if !key.ends_with(BIN_SUFFIX) {
+                return None;
+            }
+            let key = key.strip_prefix(TRAILER_PREFIX).unwrap_or(key);
+            Some((key, base64_decode(val).ok()?))
+        })
     }
 
     fn insert_ascii(
         &mut self,
-        key: impl IntoHeaderName + AsRef<str>,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
         val: impl Into<String>,
     ) -> Result<(), Error> {
-        self.insert(validate_ascii_key(key)?, ascii_value(val)?);
+        self.insert(ascii_key(key)?, ascii_value(val)?);
         Ok(())
     }
 
     fn insert_binary(
         &mut self,
-        key: impl IntoHeaderName + AsRef<str>,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
         val: impl AsRef<[u8]>,
     ) -> Result<(), Error> {
-        self.insert(validate_binary_key(key)?, binary_value(val));
+        self.insert(binary_key(key)?, binary_value(val));
         Ok(())
     }
 
     fn append_ascii(
         &mut self,
-        key: impl IntoHeaderName + AsRef<str>,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
         val: impl Into<String>,
     ) -> Result<(), Error> {
-        self.append(validate_ascii_key(key)?, ascii_value(val)?);
+        self.append(ascii_key(key)?, ascii_value(val)?);
         Ok(())
     }
 
     fn append_binary(
         &mut self,
-        key: impl IntoHeaderName + AsRef<str>,
+        key: impl TryInto<HeaderName, Error: Into<Error>>,
         val: impl AsRef<[u8]>,
     ) -> Result<(), Error> {
-        self.append(validate_binary_key(key)?, binary_value(val));
+        self.append(binary_key(key)?, binary_value(val));
         Ok(())
     }
 }
 
-fn validate_ascii_key<T: AsRef<str>>(key: T) -> Result<T, Error> {
-    if key.as_ref().ends_with(BIN) {
+fn get_maybe_trailer(
+    headers: &HeaderMap,
+    key: impl AsHeaderName + AsRef<str>,
+) -> Option<&HeaderValue> {
+    let trailer_key = format!("{TRAILER_PREFIX}{}", key.as_ref());
+    headers.get(key).or_else(|| headers.get(trailer_key))
+}
+
+fn get_all_maybe_trailer(
+    headers: &HeaderMap,
+    key: impl AsHeaderName + AsRef<str>,
+    override_empty: bool,
+) -> impl Iterator<Item = &'_ HeaderValue> + '_ {
+    if override_empty {
+        Box::new(std::iter::empty()) as Box<dyn Iterator<Item = &HeaderValue>>
+    } else {
+        let trailer_key = format!("{TRAILER_PREFIX}{}", key.as_ref());
+        Box::new(
+            headers
+                .get_all(key)
+                .into_iter()
+                .chain(headers.get_all(trailer_key)),
+        )
+    }
+}
+
+fn ascii_key(key: impl TryInto<HeaderName, Error: Into<Error>>) -> Result<HeaderName, Error> {
+    let key = key.try_into().map_err(Into::into)?;
+    if key.as_str().ends_with(BIN_SUFFIX) {
         return Err(Error::InvalidMetadata(
             "ASCII metadata keys may not end with '-bin'",
         ));
@@ -130,8 +173,9 @@ fn validate_ascii_key<T: AsRef<str>>(key: T) -> Result<T, Error> {
     Ok(key)
 }
 
-fn validate_binary_key<T: AsRef<str>>(key: T) -> Result<T, Error> {
-    if !key.as_ref().ends_with(BIN) {
+fn binary_key(key: impl TryInto<HeaderName, Error: Into<Error>>) -> Result<HeaderName, Error> {
+    let key = key.try_into().map_err(Into::into)?;
+    if !key.as_str().ends_with(BIN_SUFFIX) {
         return Err(Error::InvalidMetadata(
             "binary metadata keys must end with '-bin'",
         ));
@@ -151,6 +195,5 @@ fn ascii_value(value: impl Into<String>) -> Result<HeaderValue, Error> {
 }
 
 fn binary_value(value: impl AsRef<[u8]>) -> HeaderValue {
-    let b64 = BASE64.encode(value);
-    b64.try_into().unwrap()
+    base64_encode(value).try_into().unwrap()
 }
