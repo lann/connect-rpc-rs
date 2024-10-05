@@ -2,6 +2,9 @@
 name = "connect-rpc"
 version = "0.1.0"
 edition = "2021"
+license-file = "LICENSE"
+description = "Connect RPC for Rust."
+repository = "https://github.com/lann/connect-rpc-rs"
 
 [features]
 default = ["reqwest"]
