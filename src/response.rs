@@ -1,7 +1,6 @@
 pub mod builder;
 pub mod error;
 
-use error::ConnectError;
 use http::{header, HeaderMap, StatusCode};
 
 use crate::{
@@ -99,6 +98,7 @@ impl<T: HttpConnectResponse> ConnectResponse for T {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct UnaryResponse<T>(http::Response<T>);
 
 impl<T> UnaryResponse<T> {
@@ -108,15 +108,12 @@ impl<T> UnaryResponse<T> {
 }
 
 impl<T: AsRef<[u8]>> UnaryResponse<T> {
-    pub fn error(&self, validate_opts: &ValidateOpts) -> Option<ConnectError> {
-        if let Some(error) = ConnectError::from_http(&self.0) {
-            Some(error)
-        } else if let Err(err) = self.validate(validate_opts) {
-            tracing::debug!(?err, "Invalid response");
-            Some(err.into())
-        } else {
-            None
+    pub fn result(self, validate_opts: &ValidateOpts) -> Result<Self, Error> {
+        if !self.0.status().is_success() {
+            return Err(Error::ConnectError(http::Response::from(self).into()));
         }
+        self.validate(validate_opts)?;
+        Ok(self)
     }
 }
 
@@ -153,6 +150,7 @@ impl<T> From<UnaryResponse<T>> for http::Response<T> {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct StreamingResponse<T>(http::Response<T>);
 
 impl<T> HttpConnectResponse for StreamingResponse<T> {

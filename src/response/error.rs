@@ -1,7 +1,6 @@
-use http::{header, HeaderValue};
-use serde::Deserialize;
+use http::{header, HeaderMap, HeaderValue};
 
-use crate::{common::base64_decode, Error};
+use crate::{common::base64_decode, metadata::Metadata, Error};
 
 const ERROR_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("application/json");
 
@@ -14,6 +13,8 @@ pub struct ConnectError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub details: Vec<ConnectErrorDetail>,
+    #[serde(skip)]
+    headers: HeaderMap,
 }
 
 impl ConnectError {
@@ -22,6 +23,7 @@ impl ConnectError {
             code: Some(code),
             message: message.to_string(),
             details: Default::default(),
+            headers: Default::default(),
         }
     }
 
@@ -29,27 +31,48 @@ impl ConnectError {
         self.code.unwrap_or(ConnectCode::Unknown)
     }
 
-    pub fn from_http(resp: &http::Response<impl AsRef<[u8]>>) -> Option<Self> {
-        let status = resp.status();
-        if status.is_success() {
-            return None;
+    pub fn metadata(&self) -> &impl Metadata {
+        &self.headers
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(serde_json::to_value(self.code()).unwrap().as_str().unwrap())?;
+        if !self.message.is_empty() {
+            write!(f, ": {}", self.message)?;
         }
-        if resp.headers().get(header::CONTENT_TYPE) == Some(&ERROR_CONTENT_TYPE) {
-            match serde_json::from_slice::<ConnectError>(resp.body().as_ref()) {
+        Ok(())
+    }
+}
+
+impl<T: AsRef<[u8]>> From<http::Response<T>> for ConnectError {
+    fn from(resp: http::Response<T>) -> Self {
+        let (parts, body) = resp.into_parts();
+        let error = if parts.headers.get(header::CONTENT_TYPE) == Some(&ERROR_CONTENT_TYPE) {
+            match serde_json::from_slice::<ConnectError>(body.as_ref()) {
                 Ok(mut error) => {
-                    error.code.get_or_insert_with(|| status.into());
-                    return Some(error);
+                    error.code.get_or_insert_with(|| parts.status.into());
+                    Some(error)
                 }
-                Err(err) => tracing::debug!(?err, "Failed to decode error JSON"),
+                Err(err) => {
+                    tracing::debug!(?err, "Failed to decode error JSON");
+                    None
+                }
             }
-        }
-        Some(Self::new(status.into(), "request invalid"))
+        } else {
+            None
+        };
+        let mut error = error.unwrap_or_else(|| Self::new(parts.status.into(), "request invalid"));
+        error.headers = parts.headers;
+        error
     }
 }
 
 impl From<Error> for ConnectError {
     fn from(err: Error) -> Self {
-        let code = match &err {
+        let code = match err {
+            Error::ConnectError(connect_error) => return connect_error,
             Error::InvalidResponse(_)
             | Error::UnacceptableEncoding(_)
             | Error::UnexpectedMessageCodec(_) => ConnectCode::Internal,
@@ -66,6 +89,7 @@ impl From<Error> for ConnectError {
 fn deserialize_error_code<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<ConnectCode>, D::Error> {
+    use serde::Deserialize;
     Option::<ConnectCode>::deserialize(deserializer).or(Ok(None))
 }
 

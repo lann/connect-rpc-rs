@@ -1,16 +1,18 @@
 use std::{
     collections::HashMap,
     io::{ErrorKind, Write},
-    time::Duration,
 };
 
 use anyhow::{bail, ensure};
 use connect_rpc::{
     metadata::Metadata,
     request::builder::RequestBuilder,
-    response::{error::ConnectCode, ConnectResponse, UnaryResponse, ValidateOpts},
+    reqwest::ReqwestClientExt,
+    response::{
+        error::{ConnectCode, ConnectError},
+        ConnectResponse,
+    },
 };
-use http::HeaderMap;
 use prost::Message;
 use tokio::{io::AsyncReadExt, task::JoinSet};
 use tracing_subscriber::{fmt::format, prelude::*, EnvFilter};
@@ -89,8 +91,7 @@ async fn run_client_test(test: ClientCompatRequest) -> anyhow::Result<ClientResp
         builder.build()?
     };
 
-    let validate_opts;
-    let mut req: reqwest::Request = {
+    let resp_result = {
         let mut builder = RequestBuilder::default()
             .scheme("http")?
             .authority(format!("{}:{}", test.host, test.port))?
@@ -109,56 +110,34 @@ async fn run_client_test(test: ClientCompatRequest) -> anyhow::Result<ClientResp
 
         let msg = &test.request_messages[0].value;
         tracing::trace!(msg = %msg.escape_ascii());
-        let http_req: http::Request<Vec<u8>> = if test.use_get_http_method {
-            let req = builder.unary_get(msg)?;
-            validate_opts = ValidateOpts::from_request(&req);
-            http::Request::from(req).map(|_| vec![])
+        if test.use_get_http_method {
+            client.execute_unary_get(builder.unary_get(msg)?).await
         } else {
-            let req = builder.unary(msg.clone())?;
-            validate_opts = ValidateOpts::from_request(&req);
-            req.into()
-        };
-        http_req.try_into()?
-    };
-    if let Some(timeout_ms) = test.timeout_ms {
-        *req.timeout_mut() = Some(Duration::from_millis(timeout_ms.into()));
-    }
-    tracing::trace!(?req);
-
-    let mut resp = match client.execute(req).await {
-        Ok(resp) => resp,
-        Err(err) => {
-            if err.is_timeout() {
-                return Ok(ConnectCode::DeadlineExceeded.into());
-            }
-            return Err(err.into());
+            client.execute_unary(builder.unary(msg.clone())?).await
         }
     };
-    tracing::trace!(?resp);
+    tracing::trace!(?resp_result);
 
     if test.cancel.is_some() {
         return Ok(ConnectCode::Canceled.into());
     }
 
-    let (response_headers, response_trailers) = headers_and_trailers(resp.headers());
-
-    let resp = {
-        let (mut parts, ()) = http::Response::default().into_parts();
-        parts.status = resp.status();
-        parts.headers = std::mem::take(resp.headers_mut());
-        let body = resp.bytes().await?;
-        UnaryResponse::from(http::Response::from_parts(parts, body))
-    };
-    if !resp.status().is_success() {
-        tracing::trace!(body = %resp.body().as_ref().escape_ascii());
-    }
-
-    let (payloads, error) = match resp.error(&validate_opts) {
-        None => {
+    match resp_result {
+        Ok(resp) => {
             let resp_msg = proto::UnaryResponse::decode(resp.body().as_ref())?;
-            (vec![resp_msg.payload.unwrap_or_default()], None)
+            let (response_headers, response_trailers) = headers_and_trailers(resp.metadata());
+            let payloads = vec![resp_msg.payload.unwrap_or_default()];
+            Ok(ClientResponseResult {
+                response_headers,
+                response_trailers,
+                payloads,
+                ..Default::default()
+            })
         }
-        Some(connect_error) => {
+        Err(err) => {
+            let connect_error = ConnectError::from(err);
+            let (response_headers, response_trailers) =
+                headers_and_trailers(connect_error.metadata());
             let code = connect_error.code();
             let details = connect_error
                 .details
@@ -170,24 +149,18 @@ async fn run_client_test(test: ClientCompatRequest) -> anyhow::Result<ClientResp
                     })
                 })
                 .collect::<anyhow::Result<_>>()?;
-            (
-                vec![],
-                Some(ResponseError {
+            Ok(ClientResponseResult {
+                response_headers,
+                response_trailers,
+                error: Some(ResponseError {
                     code: proto::Code::from(code) as i32,
                     message: Some(connect_error.message),
                     details,
                 }),
-            )
+                ..Default::default()
+            })
         }
-    };
-
-    Ok(ClientResponseResult {
-        response_headers,
-        response_trailers,
-        payloads,
-        error,
-        ..Default::default()
-    })
+    }
 }
 
 async fn read_request<T: Message + Default>() -> anyhow::Result<Option<T>> {
@@ -212,7 +185,7 @@ fn write_response(resp: impl Message) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn headers_and_trailers(metadata: &HeaderMap) -> (Vec<Header>, Vec<Header>) {
+fn headers_and_trailers(metadata: &impl Metadata) -> (Vec<Header>, Vec<Header>) {
     let mut headers: HashMap<&str, Header> = HashMap::new();
     let mut trailers: HashMap<&str, Header> = HashMap::new();
     for (key, val) in metadata.iter_ascii() {
